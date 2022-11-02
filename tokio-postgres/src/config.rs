@@ -16,7 +16,8 @@ use std::ffi::OsStr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::str;
 use std::str::FromStr;
 use std::time::Duration;
@@ -34,7 +35,8 @@ pub enum TargetSessionAttrs {
 }
 
 /// TLS configuration.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum SslMode {
     /// Do not use TLS.
@@ -43,6 +45,10 @@ pub enum SslMode {
     Prefer,
     /// Require the use of TLS.
     Require,
+    /// Require the use of TLS.
+    VerifyCa,
+    /// Require the use of TLS.
+    VerifyFull,
 }
 
 /// Channel binding configuration.
@@ -55,6 +61,16 @@ pub enum ChannelBinding {
     Prefer,
     /// Require the use of channel binding.
     Require,
+}
+
+/// Replication mode configuration.
+#[derive(Debug, Copy, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ReplicationMode {
+    /// Physical replication.
+    Physical,
+    /// Logical replication.
+    Logical,
 }
 
 /// A host specification.
@@ -85,8 +101,12 @@ pub enum Host {
 /// * `dbname` - The name of the database to connect to. Defaults to the username.
 /// * `options` - Command line options used to configure the server.
 /// * `application_name` - Sets the `application_name` parameter on the server.
+/// * `sslcert` - Location of the client SSL certificate file.
+/// * `sslkey` - Location for the secret key file used for the client certificate.
 /// * `sslmode` - Controls usage of TLS. If set to `disable`, TLS will not be used. If set to `prefer`, TLS will be used
-///     if available, but not used otherwise. If set to `require`, TLS will be forced to be used. Defaults to `prefer`.
+///     if available, but not used otherwise. If set to `require`, `verify-ca`, or `verify-full`, TLS will be forced to
+///     be used. Defaults to `prefer`.
+/// * `sslrootcert` - Location of SSL certificate authority (CA) certificate.
 /// * `host` - The host to connect to. On Unix platforms, if the host starts with a `/` character it is treated as the
 ///     path to the directory containing Unix domain sockets. Otherwise, it is treated as a hostname. Multiple hosts
 ///     can be specified, separated by commas. Each host will be tried in turn when connecting. Required if connecting
@@ -156,7 +176,10 @@ pub struct Config {
     pub(crate) dbname: Option<String>,
     pub(crate) options: Option<String>,
     pub(crate) application_name: Option<String>,
+    pub(crate) ssl_cert: Option<Vec<u8>>,
+    pub(crate) ssl_key: Option<Vec<u8>>,
     pub(crate) ssl_mode: SslMode,
+    pub(crate) ssl_root_cert: Option<Vec<u8>>,
     pub(crate) host: Vec<Host>,
     pub(crate) port: Vec<u16>,
     pub(crate) connect_timeout: Option<Duration>,
@@ -164,6 +187,7 @@ pub struct Config {
     pub(crate) keepalive_config: KeepaliveConfig,
     pub(crate) target_session_attrs: TargetSessionAttrs,
     pub(crate) channel_binding: ChannelBinding,
+    pub(crate) replication_mode: Option<ReplicationMode>,
 }
 
 impl Default for Config {
@@ -186,7 +210,10 @@ impl Config {
             dbname: None,
             options: None,
             application_name: None,
+            ssl_cert: None,
+            ssl_key: None,
             ssl_mode: SslMode::Prefer,
+            ssl_root_cert: None,
             host: vec![],
             port: vec![],
             connect_timeout: None,
@@ -194,6 +221,7 @@ impl Config {
             keepalive_config,
             target_session_attrs: TargetSessionAttrs::Any,
             channel_binding: ChannelBinding::Prefer,
+            replication_mode: None,
         }
     }
 
@@ -264,6 +292,32 @@ impl Config {
         self.application_name.as_deref()
     }
 
+    /// Sets the client SSL certificate in PEM format.
+    ///
+    /// Defaults to `None`.
+    pub fn ssl_cert(&mut self, ssl_cert: &[u8]) -> &mut Config {
+        self.ssl_cert = Some(ssl_cert.into());
+        self
+    }
+
+    /// Gets the location of the client SSL certificate in PEM format.
+    pub fn get_ssl_cert(&self) -> Option<&[u8]> {
+        self.ssl_cert.as_deref()
+    }
+
+    /// Sets the client SSL key in PEM format.
+    ///
+    /// Defaults to `None`.
+    pub fn ssl_key(&mut self, ssl_key: &[u8]) -> &mut Config {
+        self.ssl_key = Some(ssl_key.into());
+        self
+    }
+
+    /// Gets the client SSL key in PEM format.
+    pub fn get_ssl_key(&self) -> Option<&[u8]> {
+        self.ssl_key.as_deref()
+    }
+
     /// Sets the SSL configuration.
     ///
     /// Defaults to `prefer`.
@@ -275,6 +329,19 @@ impl Config {
     /// Gets the SSL configuration.
     pub fn get_ssl_mode(&self) -> SslMode {
         self.ssl_mode
+    }
+
+    /// Sets the SSL certificate authority (CA) certificate in PEM format.
+    ///
+    /// Defaults to `None`.
+    pub fn ssl_root_cert(&mut self, ssl_root_cert: &[u8]) -> &mut Config {
+        self.ssl_root_cert = Some(ssl_root_cert.into());
+        self
+    }
+
+    /// Gets the SSL certificate authority (CA) certificate in PEM format.
+    pub fn get_ssl_root_cert(&self) -> Option<&[u8]> {
+        self.ssl_root_cert.as_deref()
     }
 
     /// Adds a host to the configuration.
@@ -424,6 +491,17 @@ impl Config {
         self.channel_binding
     }
 
+    /// Set replication mode.
+    pub fn replication_mode(&mut self, replication_mode: ReplicationMode) -> &mut Config {
+        self.replication_mode = Some(replication_mode);
+        self
+    }
+
+    /// Get replication mode.
+    pub fn get_replication_mode(&self) -> Option<ReplicationMode> {
+        self.replication_mode
+    }
+
     fn param(&mut self, key: &str, value: &str) -> Result<(), Error> {
         match key {
             "user" => {
@@ -441,15 +519,41 @@ impl Config {
             "application_name" => {
                 self.application_name(value);
             }
+            "sslcert" => match std::fs::read(&value) {
+                Ok(contents) => {
+                    self.ssl_cert(&contents);
+                }
+                Err(_) => {
+                    return Err(Error::config_parse(Box::new(InvalidValue("sslcert"))));
+                }
+            },
+            "sslkey" => match std::fs::read(&value) {
+                Ok(contents) => {
+                    self.ssl_key(&contents);
+                }
+                Err(_) => {
+                    return Err(Error::config_parse(Box::new(InvalidValue("sslkey"))));
+                }
+            },
             "sslmode" => {
                 let mode = match value {
                     "disable" => SslMode::Disable,
                     "prefer" => SslMode::Prefer,
                     "require" => SslMode::Require,
+                    "verify-ca" => SslMode::VerifyCa,
+                    "verify-full" => SslMode::VerifyFull,
                     _ => return Err(Error::config_parse(Box::new(InvalidValue("sslmode")))),
                 };
                 self.ssl_mode(mode);
             }
+            "sslrootcert" => match std::fs::read(&value) {
+                Ok(contents) => {
+                    self.ssl_root_cert(&contents);
+                }
+                Err(_) => {
+                    return Err(Error::config_parse(Box::new(InvalidValue("sslrootcert"))));
+                }
+            },
             "host" => {
                 for host in value.split(',') {
                     self.host(host);
@@ -527,6 +631,17 @@ impl Config {
                 };
                 self.channel_binding(channel_binding);
             }
+            "replication" => {
+                let mode = match value {
+                    "off" => None,
+                    "true" => Some(ReplicationMode::Physical),
+                    "database" => Some(ReplicationMode::Logical),
+                    _ => return Err(Error::config_parse(Box::new(InvalidValue("replication")))),
+                };
+                if let Some(mode) = mode {
+                    self.replication_mode(mode);
+                }
+            }
             key => {
                 return Err(Error::config_parse(Box::new(UnknownOption(
                     key.to_string(),
@@ -591,7 +706,10 @@ impl fmt::Debug for Config {
             .field("dbname", &self.dbname)
             .field("options", &self.options)
             .field("application_name", &self.application_name)
+            .field("ssl_cert", &self.ssl_cert)
+            .field("ssl_key", &self.ssl_key)
             .field("ssl_mode", &self.ssl_mode)
+            .field("ssl_root_cert", &self.ssl_root_cert)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("connect_timeout", &self.connect_timeout)
@@ -601,6 +719,7 @@ impl fmt::Debug for Config {
             .field("keepalives_retries", &self.keepalive_config.retries)
             .field("target_session_attrs", &self.target_session_attrs)
             .field("channel_binding", &self.channel_binding)
+            .field("replication", &self.replication_mode)
             .finish()
     }
 }
